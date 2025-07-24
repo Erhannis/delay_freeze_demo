@@ -1,4 +1,4 @@
-Demo of RTIC delay not returning.  Note that it's currently configured to get flashed via probe-rs.  Expect to see like
+Demo of RTIC delay not returning.  Note that it's currently configured to get flashed via probe-rs.  (Hook up the target chip via a serial debugger and do `cargo run`.)  Expect to see like
 
 ```
 ...
