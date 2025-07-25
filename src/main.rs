@@ -52,6 +52,8 @@ mod app {
   // Local resources go here
   #[local]
   struct Local {
+    rx_msg_in: StaticReceiver<Vec<u32, MSG_SIZE>>,
+    rx_msg_total: u32,
   }
 
   #[init]
@@ -65,7 +67,6 @@ mod app {
     let (rms, rmr) = RX_MSG_CHANNEL.split();
 
     looper::spawn().ok();
-    msg_receiver::spawn(rmr).ok();
 
     let mut mc = Multicore::new(&mut peripherals.PSM, &mut peripherals.PPB, &mut sio.fifo);
     let cores = mc.cores();
@@ -76,7 +77,7 @@ mod app {
       doesn't wake up and see it until the next time an event triggers (e.g. a task timer).
       I don't know if there are unintended side effects.
       */
-      unsafe { rp2040_hal::pac::NVIC::unmask(rp2040_hal::pac::Interrupt::SW0_IRQ); }
+      unsafe { rp2040_hal::pac::NVIC::unmask(rp2040_hal::pac::Interrupt::SW1_IRQ); }
       msg_emitter(rms);
     });
 
@@ -84,6 +85,8 @@ mod app {
       Shared {
       },
       Local {
+        rx_msg_in: rmr,
+        rx_msg_total: 0,
       },
     )
   }
@@ -105,28 +108,44 @@ mod app {
     }
   }
   
-  #[task(priority = 1)]
-  async fn msg_receiver(
+  #[task(priority = 1, binds = SW1_IRQ, local = [rx_msg_in, rx_msg_total])]
+  fn msg_receiver(
     mut ctx: msg_receiver::Context,
-    rx_msg_in: StaticReceiver<Vec<u8, MSG_SIZE>>,
   ) {
+    trace!("msg_receiver await msg @{}", Mono::now().ticks());
+    //THINK I could A. loop until I get the expected message, in case it's possible for it to be delayed, or B. loop until I STOP getting messages, in case I missed one before.  ...I guess I could C. loop until I got at least one, then keep looping until they stop.  Hmm.
+    let mut count = 0;
     loop {
-      trace!("msg_receiver await msg @{}", Mono::now().ticks());
-      match rx_msg_in.recv().await {
-        Some(msg) => {
-          info!("msg_receiver rx msg @{} [{}]", Mono::now().ticks(), msg.len());
+      match ctx.local.rx_msg_in.try_recv() {
+        Ok(msg) => {
+          info!("msg_receiver rx msg @{} [{}] ({})", Mono::now().ticks(), msg.len(), msg[0]);
+          if msg[0] != *ctx.local.rx_msg_total {
+            error!("msg_receiver msg wrong, {} != {}", msg[0], *ctx.local.rx_msg_total);
+          }
+          *ctx.local.rx_msg_total += 1;
+          count += 1;
         },
-        None =>  {
-          error!("msg_receiver rx error, channel closed?");
+        Err(_) =>  {
+          // error!("msg_receiver rx error, channel closed?");
+          if count > 0 {
+            if count > 1 {
+              *ctx.local.rx_msg_total += 1; //DUMMY Trigger an error
+            }
+            // Received at least one message; return
+            info!("msg_receiver rx group of {}", count);
+            return;
+          } else {
+            *ctx.local.rx_msg_total += 1; //DUMMY Trigger an error
+          }
         },
-      }          
-    }
+      }
+    }     
   }
 
-  static RX_MSG_CHANNEL: StaticChannel<Vec<u8, MSG_SIZE>, CHAN_SIZE> = StaticChannel::new();
+  static RX_MSG_CHANNEL: StaticChannel<Vec<u32, MSG_SIZE>, CHAN_SIZE> = StaticChannel::new();
   static mut CORE1_STACK: Stack<4096> = Stack::new();
   //SHAME Blehhhh, typing clutter
-  fn msg_emitter(rx_msg_out: StaticSender<Vec<u8, MSG_SIZE>>) {
+  fn msg_emitter(rx_msg_out: StaticSender<Vec<u32, MSG_SIZE>>) {
     let mut pac = unsafe { pac::Peripherals::steal() };
     let core = unsafe { pac::CorePeripherals::steal() };
     let mut _sio = Sio::new(pac.SIO);
@@ -134,10 +153,11 @@ mod app {
     let clocks = init_clocks_and_plls(XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog).ok().unwrap();
     let mut _delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
+    let mut tx_msg_total: u32 = 0;
     let mut rng = Mt64::new_unseeded();
     loop {
       // Timing seems to be important.  500ms flat delay didn't trigger the problem.
-      _delay.delay_us((rng.next_u64() & 10_000_u64) as u32);
+      _delay.delay_us((rng.next_u64() & 100_u64) as u32);
 
 /*
 Seems like the timing needs to be such that delay restart happens after pushing to channel, and before it's received.
@@ -152,13 +172,12 @@ It doesn't appear sufficient, not by the logs - I had that pattern 11 times one 
 It may be related to sharing SW0_IRQ on both cores.
 */
 
-      let buffer = [];
-      let mut msg = Vec::<u8, MSG_SIZE>::new();
-      for &byte in buffer.iter().take(MSG_SIZE) {
-        msg.push(byte).ok();
-      }
+      let mut msg = Vec::<u32, MSG_SIZE>::new();
+      msg.push(tx_msg_total).ok();
+      tx_msg_total += 1;
       trace!("Pushing to channel @{}", Mono::now().ticks());
       rx_msg_out.try_send(msg).ok();
+      rp2040_hal::pac::NVIC::pend(rp2040_hal::pac::Interrupt::SW1_IRQ);
     }
   }
 }
