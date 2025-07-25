@@ -54,6 +54,7 @@ mod app {
   struct Local {
     rx_msg_in: StaticReceiver<Vec<u32, MSG_SIZE>>,
     rx_msg_total: u32,
+    proc_msg_out: StaticSender<Vec<u32, MSG_SIZE>>,
   }
 
   #[init]
@@ -65,8 +66,10 @@ mod app {
     Mono::start(peripherals.TIMER, &peripherals.RESETS);
   
     let (rms, rmr) = RX_MSG_CHANNEL.split();
+    let (pms, pmr) = PROC_MSG_CHANNEL.split();
 
-    looper::spawn().ok();
+    looper::spawn(pmr).ok();
+    dummy_looper::spawn(pms.clone()).ok();
 
     let mut mc = Multicore::new(&mut peripherals.PSM, &mut peripherals.PPB, &mut sio.fifo);
     let cores = mc.cores();
@@ -87,6 +90,7 @@ mod app {
       Local {
         rx_msg_in: rmr,
         rx_msg_total: 0,
+        proc_msg_out: pms,
       },
     )
   }
@@ -99,16 +103,49 @@ mod app {
     }
   }
 
+  static PROC_MSG_CHANNEL: StaticChannel<Vec<u32, MSG_SIZE>, CHAN_SIZE> = StaticChannel::new();
   #[task(priority = 1)]
-  async fn looper(mut ctx: looper::Context) -> () {
+  async fn looper(
+    mut ctx: looper::Context,
+    mut proc_msg_in: StaticReceiver<Vec<u32, MSG_SIZE>>,
+  ) -> () {
     loop {
-      trace!("delay...");
-      Mono::delay(10_u64.millis()).await;
-      trace!("...delay done @{}", Mono::now().ticks()); //DUMMY Sometimes this never gets called and the loop just stops???
+      // trace!("delay...");
+      // Mono::delay(10_u64.millis()).await;
+      // trace!("...delay done @{}", Mono::now().ticks()); //DUMMY Sometimes this never gets called and the loop just stops???
+      trace!("await proc msg...");
+      match proc_msg_in.recv().await {
+        Some(msg) => {
+          trace!("rx proc msg {}", msg[0]);
+        },
+        None => {
+          error!("rx proc msg fail, channel closed?");
+        },
+      }
     }
   }
-  
-  #[task(priority = 1, binds = SW1_IRQ, local = [rx_msg_in, rx_msg_total])]
+
+  #[task(priority = 1)]
+  async fn dummy_looper(
+    mut ctx: dummy_looper::Context,
+    mut proc_msg_out: StaticSender<Vec<u32, MSG_SIZE>>,
+  ) -> () {
+    let mut tx_msg_total: u32 = 0;
+
+    loop {
+      // trace!("delay...");
+      Mono::delay(1000_u64.millis()).await;
+      // trace!("...delay done @{}", Mono::now().ticks()); //DUMMY Sometimes this never gets called and the loop just stops???
+      let mut msg = Vec::<u32, MSG_SIZE>::new();
+      msg.push(tx_msg_total).ok();
+      tx_msg_total += 1;
+
+      trace!("Dummy pushing {} to channel @{}", msg[0], Mono::now().ticks());
+      proc_msg_out.try_send(msg).ok();
+    }
+  }
+
+  #[task(priority = 1, binds = SW1_IRQ, local = [rx_msg_in, rx_msg_total, proc_msg_out])]
   fn msg_receiver(
     mut ctx: msg_receiver::Context,
   ) {
@@ -124,6 +161,9 @@ mod app {
           }
           *ctx.local.rx_msg_total += 1;
           count += 1;
+          info!("msg_receiver tx msg proc");
+          ctx.local.proc_msg_out.try_send(msg).ok(); //BUG This does not wake up the task waiting for messages, whereas the msg from dummy_looper does.
+          // rp2040_hal::pac::NVIC::pend(rp2040_hal::pac::Interrupt::SW0_IRQ);
         },
         Err(_) =>  {
           // error!("msg_receiver rx error, channel closed?");
@@ -157,7 +197,7 @@ mod app {
     let mut rng = Mt64::new_unseeded();
     loop {
       // Timing seems to be important.  500ms flat delay didn't trigger the problem.
-      _delay.delay_us((rng.next_u64() & 100_u64) as u32);
+      _delay.delay_us((rng.next_u64() & 1_000_000_u64) as u32);
 
 /*
 Seems like the timing needs to be such that delay restart happens after pushing to channel, and before it's received.
